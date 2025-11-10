@@ -113,8 +113,8 @@
         async function authenticateUser() {
             onAuthStateChanged(auth, async (user) => {
                 if (user) {
-                    //userId = user.uid; // Still needed for auth rules
-                    //console.log("Authenticated with UserID:", userId);
+                    userId = user.uid; // Still needed for auth rules
+                    console.log("Authenticated with UserID:", userId);
                     
 
                     
