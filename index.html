@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vokabeltrainer</title>
+    <!-- Import Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Import Firebase libraries -->
+    <script type="module">
+        // Import necessary Firebase functions
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            signInWithCustomToken, 
+            onAuthStateChanged,
+            setPersistence,
+            browserLocalPersistence
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            collection, 
+            addDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            query,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Global Variables ---
+        let app, db, auth;
+        let userId, appId;
+        let listName = null; // NEW: The shared list name
+        let wordList = []; // Local cache of the word list
+        let currentWord = null;
+        let selectedQuizMode = 'random'; // 'enToDe', 'deToEn', or 'random'
+        let unsubscribeFromWords = null; // To stop listening to old list
+
+        // --- DOM Elements ---
+        const loadingView = document.getElementById('loading-view');
+        const listNameView = document.getElementById('list-name-view'); // NEW
+        const listNameInput = document.getElementById('list-name-input'); // NEW
+        const listNameSubmit = document.getElementById('list-name-submit'); // NEW
+        
+        const appView = document.getElementById('app-view');
+        const listNameDisplay = document.getElementById('list-name-display'); // RENAMED
+        const changeListBtn = document.getElementById('change-list-btn'); // NEW
+        
+        const navLearn = document.getElementById('nav-learn');
+        const navAdmin = document.getElementById('nav-admin');
+        const learnView = document.getElementById('learn-view');
+        const adminView = document.getElementById('admin-view');
+
+        // Admin View Elements
+        const adminForm = document.getElementById('admin-form');
+        const englishInput = document.getElementById('english-input');
+        const germanInput = document.getElementById('german-input');
+        const adminWordList = document.getElementById('admin-word-list');
+        const wordCountDisplay = document.getElementById('word-count-display');
+
+        // Learn View Elements
+        const modeEnDe = document.getElementById('mode-en-de');
+        const modeDeEn = document.getElementById('mode-de-en');
+        const modeRandom = document.getElementById('mode-random');
+        const promptLanguage = document.getElementById('prompt-language');
+        const promptWord = document.getElementById('prompt-word');
+        const answerInput = document.getElementById('answer-input');
+        const checkAnswerBtn = document.getElementById('check-answer-btn');
+        const nextWordBtn = document.getElementById('next-word-btn');
+        const feedbackMessage = document.getElementById('feedback-message');
+        const quizStartMessage = document.getElementById('quiz-start-message');
+        const quizArea = document.getElementById('quiz-area');
+
+        // --- Firebase Initialization ---
+        
+        // Get Firebase config and App ID from global variables
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        async function initializeFirebase() {
+            try {
+                setLogLevel('Debug');
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                appId = currentAppId;
+                await setPersistence(auth, browserLocalPersistence);
+                await authenticateUser();
+            } catch (error) {
+                console.error("Firebase Init Error:", error);
+                loadingView.textContent = "Fehler beim Laden der App. Bitte Konsole prüfen.";
+            }
+        }
+
+        async function authenticateUser() {
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid; // Still needed for auth rules
+                    console.log("Authenticated with UserID:", userId);
+                    
+                    // Check if a list name is already saved
+                    const savedListName = localStorage.getItem('vocabListName');
+                    if (savedListName) {
+                        await handleListLogin(savedListName);
+                    } else {
+                        // No list name saved, show the login form
+                        loadingView.classList.add('hidden');
+                        listNameView.classList.remove('hidden');
+                    }
+                } else {
+                    // No user, attempt to sign in
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined') {
+                            await signInWithCustomToken(auth, __initial_auth_token);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Authentication Error:", error);
+                        loadingView.textContent = "Fehler bei der Authentifizierung. Bitte neu laden.";
+                    }
+                }
+            });
+        }
+        
+        // --- NEW: Handle List Login ---
+        async function handleListLogin(name) {
+            const trimmedName = name.trim();
+            if (!trimmedName) {
+                alert("Bitte einen gültigen Listennamen eingeben."); // Simple validation
+                return;
+            }
+            
+            listName = trimmedName;
+            localStorage.setItem('vocabListName', listName);
+            listNameDisplay.textContent = `Liste: ${listName}`;
+            
+            await loadWords();
+            
+            listNameView.classList.add('hidden');
+            loadingView.classList.add('hidden');
+            appView.classList.remove('hidden');
+            showView('learn'); // Start on learn view
+        }
+
+        // --- NEW: Handle List Logout ---
+        function handleListLogout() {
+            if (unsubscribeFromWords) {
+                unsubscribeFromWords(); // Stop listening to Firestore
+                unsubscribeFromWords = null;
+            }
+            
+            localStorage.removeItem('vocabListName');
+            listName = null;
+            wordList = [];
+            
+            // Clear UI
+            updateAdminWordList();
+            checkQuizAvailability();
+            
+            appView.classList.add('hidden');
+            listNameInput.value = '';
+            listNameView.classList.remove('hidden');
+        }
+
+        // --- Firestore Data Functions (MODIFIED) ---
+
+        async function loadWords() {
+            // Stop listening to the old list, if any
+            if (unsubscribeFromWords) {
+                unsubscribeFromWords();
+            }
+
+            if (!listName || !appId) {
+                console.error("Listen-Name or App ID is missing.");
+                return;
+            }
+            
+            // NEW: Use public path based on listName
+            const vocabColPath = `artifacts/${appId}/public/data/vocab-lists/${listName}/words`;
+            console.log("Listening to path:", vocabColPath);
+            const q = query(collection(db, vocabColPath));
+
+            // Use onSnapshot for real-time updates
+            unsubscribeFromWords = onSnapshot(q, (querySnapshot) => {
+                wordList = [];
+                querySnapshot.forEach((doc) => {
+                    wordList.push({ id: doc.id, ...doc.data() });
+                });
+                
+                console.log("Words loaded:", wordList.length);
+                // Update UI elements that depend on the word list
+                updateAdminWordList();
+                updateWordCount();
+                checkQuizAvailability();
+                
+                // If on learn view and no word is selected, start quiz
+                if (!learnView.classList.contains('hidden') && !currentWord) {
+                    startNextWord();
+                }
+                
+            }, (error) => {
+                console.error("Error listening to word list: ", error);
+            });
+        }
+
+        async function handleAddWord(e) {
+            e.preventDefault();
+            const english = englishInput.value.trim();
+            const german = germanInput.value.trim();
+
+            // MODIFIED: Check for listName
+            if (english && german && listName && appId) {
+                try {
+                    // NEW: Use public path
+                    const vocabColPath = `artifacts/${appId}/public/data/vocab-lists/${listName}/words`;
+                    await addDoc(collection(db, vocabColPath), {
+                        english: english,
+                        german: german
+                    });
+                    
+                    // Clear inputs
+                    englishInput.value = '';
+                    germanInput.value = '';
+                } catch (error) {
+                    console.error("Error adding word: ", error);
+                }
+            } else {
+                console.warn("Missing data for adding word", {english, german, listName, appId});
+            }
+        }
+
+        async function handleDeleteWord(wordId) {
+            // MODIFIED: Check for listName
+            if (!wordId || !listName || !appId) return;
+            
+            try {
+                // NEW: Use public path
+                const wordDocPath = `artifacts/${appId}/public/data/vocab-lists/${listName}/words/${wordId}`;
+                await deleteDoc(doc(db, wordDocPath));
+            } catch (error) {
+                console.error("Error deleting word: ", error);
+            }
+        }
+
+        // --- UI Update Functions (Unchanged) ---
+
+        function updateAdminWordList() {
+            adminWordList.innerHTML = ''; // Clear existing list
+            
+            if (wordList.length === 0) {
+                adminWordList.innerHTML = '<p class="text-gray-500 italic">Noch keine Wörter hinzugefügt.</p>';
+                return;
+            }
+
+            wordList.forEach(word => {
+                const item = document.createElement('div');
+                item.className = 'flex justify-between items-center p-3 bg-gray-50 rounded-lg shadow-sm';
+                
+                item.innerHTML = `
+                    <div>
+                        <span class="font-semibold text-blue-800">${word.english}</span>
+                        <span class="text-gray-600"> / </span>
+                        <span class="font-semibold text-green-800">${word.german}</span>
+                    </div>
+                    <button data-id="${word.id}" class="delete-btn bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-3 rounded-md text-sm transition duration-150">
+                        Löschen
+                    </button>
+                `;
+                adminWordList.appendChild(item);
+            });
+        }
+        
+        function updateWordCount() {
+            wordCountDisplay.textContent = `Wörter gesamt: ${wordList.length}`;
+        }
+        
+        function checkQuizAvailability() {
+            if (wordList.length === 0) {
+                quizStartMessage.classList.remove('hidden');
+                quizArea.classList.add('hidden');
+                currentWord = null; // No words, so no current word
+            } else {
+                quizStartMessage.classList.add('hidden');
+                quizArea.classList.remove('hidden');
+            }
+        }
+
+        function updateModeButtons() {
+            // Reset all buttons
+            modeEnDe.classList.remove('bg-blue-600', 'text-white');
+            modeDeEn.classList.remove('bg-blue-600', 'text-white');
+            modeRandom.classList.remove('bg-blue-600', 'text-white');
+            
+            modeEnDe.classList.add('bg-white', 'text-blue-700', 'hover:bg-blue-100');
+            modeDeEn.classList.add('bg-white', 'text-blue-700', 'hover:bg-blue-100');
+            modeRandom.classList.add('bg-white', 'text-blue-700', 'hover:bg-blue-100');
+            
+            // Set the active button
+            if (selectedQuizMode === 'enToDe') {
+                modeEnDe.classList.add('bg-blue-600', 'text-white');
+                modeEnDe.classList.remove('bg-white', 'text-blue-700', 'hover:bg-blue-100');
+            } else if (selectedQuizMode === 'deToEn') {
+                modeDeEn.classList.add('bg-blue-600', 'text-white');
+                modeDeEn.classList.remove('bg-white', 'text-blue-700', 'hover:bg-blue-100');
+            } else { // 'random'
+                modeRandom.classList.add('bg-blue-600', 'text-white');
+                modeRandom.classList.remove('bg-white', 'text-blue-700', 'hover:bg-blue-100');
+            }
+        }
+
+        // --- Quiz Logic (Unchanged) ---
+
+        function startNextWord() {
+            if (wordList.length === 0) {
+                checkQuizAvailability();
+                return;
+            }
+            
+            // Reset UI
+            feedbackMessage.innerHTML = '';
+            answerInput.value = '';
+            answerInput.disabled = false;
+            checkAnswerBtn.disabled = false;
+            nextWordBtn.classList.add('hidden');
+            checkAnswerBtn.classList.remove('hidden');
+            answerInput.focus();
+
+            // Pick a random word
+            currentWord = wordList[Math.floor(Math.random() * wordList.length)];
+            
+            // Determine quiz type based on selectedQuizMode
+            let quizType;
+            if (selectedQuizMode === 'enToDe') {
+                quizType = 'enToDe';
+            } else if (selectedQuizMode === 'deToEn') {
+                quizType = 'deToEn';
+            } else { // 'random'
+                quizType = Math.random() < 0.5 ? 'enToDe' : 'deToEn';
+            }
+            
+            // Store this for handleCheckAnswer
+            currentWord.quizType = quizType; 
+            
+            // Display the prompt
+            if (quizType === 'enToDe') {
+                promptLanguage.textContent = 'Übersetze dieses englische Wort ins Deutsche:';
+                promptWord.textContent = currentWord.english;
+            } else {
+                promptLanguage.textContent = 'Übersetze dieses deutsche Wort ins Englische:';
+                promptWord.textContent = currentWord.german;
+            }
+        }
+
+        function handleCheckAnswer() {
+            const userAnswer = answerInput.value.trim().toLowerCase();
+            if (!userAnswer || !currentWord) return;
+
+            const quizType = currentWord.quizType;
+            const correctAnswer = (quizType === 'enToDe' ? currentWord.german : currentWord.english).toLowerCase();
+
+            if (userAnswer === correctAnswer) {
+                feedbackMessage.innerHTML = '<p class="text-green-600 font-bold text-lg">Richtig! 🎉</p>';
+            } else {
+                const originalCorrect = quizType === 'enToDe' ? currentWord.german : currentWord.english;
+                feedbackMessage.innerHTML = `
+                    <p class="text-red-600 font-bold text-lg">Nicht ganz.</p>
+                    <p class="text-gray-700 mt-1">Die richtige Antwort war: <span class="font-semibold">${originalCorrect}</span></p>
+                `;
+            }
+            
+            answerInput.disabled = true;
+            checkAnswerBtn.disabled = true;
+            checkAnswerBtn.classList.add('hidden');
+            nextWordBtn.classList.remove('hidden');
+            nextWordBtn.focus();
+        }
+
+        // --- Navigation ---
+        
+        function showView(view) {
+            learnView.classList.add('hidden');
+            adminView.classList.add('hidden');
+            navLearn.classList.remove('bg-blue-600', 'text-white');
+            navLearn.classList.add('text-blue-700', 'hover:bg-blue-100');
+            navAdmin.classList.remove('bg-blue-600', 'text-white');
+            navAdmin.classList.add('text-blue-700', 'hover:bg-blue-100');
+
+            if (view === 'learn') {
+                learnView.classList.remove('hidden');
+                navLearn.classList.add('bg-blue-600', 'text-white');
+                navLearn.classList.remove('text-blue-700', 'hover:bg-blue-100');
+                if (wordList.length > 0) {
+                    startNextWord();
+                } else {
+                    checkQuizAvailability();
+                }
+            } else {
+                adminView.classList.remove('hidden');
+                navAdmin.classList.add('bg-blue-600', 'text-white');
+                navAdmin.classList.remove('text-blue-700', 'hover:bg-blue-100');
+            }
+        }
+
+        // --- Event Listeners (MODIFIED) ---
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeFirebase();
+            
+            // --- NEW: List Name Listeners ---
+            listNameSubmit.addEventListener('click', () => handleListLogin(listNameInput.value));
+            listNameInput.addEventListener('keyup', (e) => {
+                if (e.key === 'Enter') {
+                    handleListLogin(listNameInput.value);
+                }
+            });
+            changeListBtn.addEventListener('click', handleListLogout);
+
+            // Navigation
+            navLearn.addEventListener('click', () => showView('learn'));
+            navAdmin.addEventListener('click', () => showView('admin'));
+
+            // Admin Form
+            adminForm.addEventListener('submit', handleAddWord);
+            
+            // Admin List (Event Delegation for delete buttons)
+            adminWordList.addEventListener('click', (e) => {
+                const deleteButton = e.target.closest('.delete-btn');
+                if (deleteButton) {
+                    const wordId = deleteButton.dataset.id;
+                    handleDeleteWord(wordId);
+                }
+            });
+
+            // Quiz Mode Selection
+            modeEnDe.addEventListener('click', () => {
+                selectedQuizMode = 'enToDe';
+                updateModeButtons();
+                startNextWord();
+            });
+            
+            modeDeEn.addEventListener('click', () => {
+                selectedQuizMode = 'deToEn';
+                updateModeButtons();
+                startNextWord();
+            });
+            
+            modeRandom.addEventListener('click', () => {
+                selectedQuizMode = 'random';
+                updateModeButtons();
+                startNextWord();
+            });
+
+            // Quiz Buttons
+            nextWordBtn.addEventListener('click', startNextWord);
+            checkAnswerBtn.addEventListener('click', handleCheckAnswer);
+            
+            answerInput.addEventListener('keyup', (e) => {
+                if (e.key === 'Enter' && !checkAnswerBtn.disabled) {
+                    handleCheckAnswer();
+                }
+            });
+            
+            // Set initial button style
+            updateModeButtons();
+        });
+
+    </script>
+</head>
+<body class="bg-blue-50 font-sans min-h-screen p-4 md:p-8">
+
+    <!-- Loading View -->
+    <div id="loading-view" class="text-center text-blue-600 font-semibold text-lg mt-20">
+        Lade Lern-App...
+    </div>
+
+    <!-- NEW: List Name View -->
+    <div id="list-name-view" class="max-w-md mx-auto mt-20 p-8 bg-white rounded-2xl shadow-xl hidden">
+        <h2 class="text-2xl font-bold text-center text-blue-700 mb-6">Willkommen!</h2>
+        <p class="text-center text-gray-600 mb-4">Bitte gib einen Namen für deine Vokabelliste ein, um sie zu laden oder neu zu erstellen.</p>
+        <p class="text-center text-sm text-gray-500 mb-6">Tipp: Benutze denselben Namen auf all deinen Geräten (z.B. "Annas-Liste").</p>
+        <div class="space-y-4">
+            <label for="list-name-input" class="block text-sm font-medium text-gray-700">Listen-Name:</label>
+            <input type="text" id="list-name-input" class="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500" placeholder="z.B. Annas-Vokabeln">
+            <button id="list-name-submit" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-150">
+                Laden / Starten
+            </button>
+        </div>
+    </div>
+
+    <!-- Main App View (Hidden by default) -->
+    <div id="app-view" class="max-w-2xl mx-auto hidden">
+    
+        <header class="text-center mb-6">
+            <h1 class="text-4xl font-bold text-blue-700">Vokabeltrainer</h1>
+            <!-- MODIFIED: Show list name and logout -->
+            <div class="flex justify-center items-center space-x-2 mt-2">
+                 <p class="text-sm text-gray-600" id="list-name-display">Liste: ...</p>
+                 <button id="change-list-btn" class="text-xs text-blue-500 hover:underline">(Wechseln)</button>
+            </div>
+        </header>
+
+        <!-- Navigation -->
+        <nav class="flex justify-center bg-white rounded-lg shadow-md p-2 mb-6 space-x-2">
+            <button id="nav-learn" class="flex-1 font-semibold py-2 px-4 rounded-md transition duration-150">
+                Lernmodus
+            </button>
+            <button id="nav-admin" class="flex-1 font-semibold py-2 px-4 rounded-md transition duration-150">
+                Wörter verwalten
+            </button>
+        </nav>
+
+        <!-- Main Content Area -->
+        <main class="bg-white p-6 md:p-8 rounded-2xl shadow-xl min-h-[400px]">
+
+            <!-- Learn View -->
+            <div id="learn-view">
+                <h2 class="text-2xl font-semibold text-gray-800 mb-4 text-center">Lass uns lernen!</h2>
+                
+                <!-- Mode Selector -->
+                <div id="mode-selector" class="flex justify-center space-x-2 mb-6">
+                    <button id="mode-en-de" class="mode-btn flex-1 py-2 px-3 text-sm font-medium rounded-md transition duration-150 bg-white text-blue-700 hover:bg-blue-100">Englisch → Deutsch</button>
+                    <button id="mode-de-en" class="mode-btn flex-1 py-2 px-3 text-sm font-medium rounded-md transition duration-150 bg-white text-blue-700 hover:bg-blue-100">Deutsch → Englisch</button>
+                    <button id="mode-random" class="mode-btn flex-1 py-2 px-3 text-sm font-medium rounded-md transition duration-150 bg-blue-600 text-white">Zufall</button>
+                </div>
+
+                <div id="quiz-start-message" class="text-center text-gray-600 p-8 hidden">
+                    <p class="text-lg">Deine Vokabelliste ist leer.</p>
+                    <p class="mt-2">Gehe zum Tab "Wörter verwalten", um deine ersten Wörter hinzuzufügen!</p>
+                </div>
+                
+                <div id="quiz-area" class="space-y-6">
+                    <!-- Prompt -->
+                    <div class="text-center">
+                        <p id="prompt-language" class="text-sm text-gray-500">Übersetze dieses Wort:</p>
+                        <p id="prompt-word" class="text-4xl font-bold text-blue-600 my-2">Wort</p>
+                    </div>
+                    
+                    <!-- Answer Input -->
+                    <div class="space-y-2">
+                        <label for="answer-input" class="block text-sm font-medium text-gray-700">Deine Antwort:</label>
+                        <input type="text" id="answer-input" class="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-blue-500 focus:border-blue-500" placeholder="Gib deine Antwort ein...">
+                    </div>
+                    
+                    <!-- Feedback -->
+                    <div id="feedback-message" class="text-center min-h-[50px]">
+                        <!-- Feedback appears here -->
+                    </div>
+                    
+                    <!-- Action Buttons -->
+                    <div class="text-center">
+                        <button id="check-answer-btn" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-150">
+                            Antwort prüfen
+                        </button>
+                        <button id="next-word-btn" class="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-150 hidden">
+                            Nächstes Wort
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Admin View -->
+            <div id="admin-view" class="hidden">
+                <h2 class="text-2xl font-semibold text-gray-800 mb-6 text-center">Wörterliste verwalten</h2>
+                
+                <!-- Add Word Form -->
+                <form id="admin-form" class="space-y-4 p-4 bg-blue-50 rounded-lg border border-blue-200">
+                    <h3 classs="text-lg font-semibold text-gray-700">Neues Wort hinzufügen</h3>
+                    <div>
+                        <label for="english-input" class="block text-sm font-medium text-gray-700">Englisch</D>
+                        <input type="text" id="english-input" required class="mt-1 w-full p-2 border border-gray-300 rounded-md shadow-sm" placeholder="z.B. Apple">
+                    </div>
+                    <div>
+                        <label for="german-input" class="block text-sm font-medium text-gray-700">Deutsch</label>
+                        <input type="text" id="german-input" required class="mt-1 w-full p-2 border border-gray-300 rounded-md shadow-sm" placeholder="z.B. Apfel">
+                    </div>
+                    <button type="submit" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow transition duration-150">
+                        Wort hinzufügen
+                    </button>
+                </form>
+
+                <!-- Word List -->
+                <div class="mt-8">
+                    <h3 id="word-count-display" class="text-lg font-semibold text-gray-700 mb-4">Wörter gesamt: 0</h3>
+                    <div id="admin-word-list" class="space-y-3 max-h-60 overflow-y-auto pr-2">
+                        <!-- Word list will be populated by JavaScript -->
+                    </div>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+</body>
+</html>
