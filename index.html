@@ -76,8 +76,24 @@
         // --- Firebase Initialization ---
         
         // Get Firebase config and App ID from global variables
-        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-        const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        // const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        // --- SCHRITT 4: DEINE KONFIGURATION EINFÜGEN ---
+        // Ersetze dies mit dem `firebaseConfig`-Objekt aus deinem eigenen Firebase-Projekt (siehe Schritt 2)
+        const firebaseConfig = {
+          apiKey: "AIzaSyClY7NeadjRKwZQDLGVmTGpg9Xc-pMS1mc",
+          authDomain: "mein-vokabeltrainer-a9328.firebaseapp.com",
+          projectId: "mein-vokabeltrainer-a9328",
+          storageBucket: "mein-vokabeltrainer-a9328.firebasestorage.app",
+          messagingSenderId: "950612234751",
+          appId: "1:950612234751:web:01215a0b977da6d87117ca"
+        };
+        // --------------------------------------------------
+
+        // Wir verwenden die Projekt-ID als eindeutigen App-Namen
+        const currentAppId = firebaseConfig.projectId || 'default-app-id';
+
 
         async function initializeFirebase() {
             try {
@@ -97,8 +113,10 @@
         async function authenticateUser() {
             onAuthStateChanged(auth, async (user) => {
                 if (user) {
-                    userId = user.uid; // Still needed for auth rules
-                    console.log("Authenticated with UserID:", userId);
+                    //userId = user.uid; // Still needed for auth rules
+                    //console.log("Authenticated with UserID:", userId);
+                    
+
                     
                     // Check if a list name is already saved
                     const savedListName = localStorage.getItem('vocabListName');
